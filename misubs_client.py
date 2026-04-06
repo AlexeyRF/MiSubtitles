@@ -9,13 +9,11 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-# Для прозрачности окна (Только для Windows!)
 if os.name == 'nt':
     import win32api
     import win32con
     import win32gui
 
-# ========== CONFIG DEFAULTS ==========
 CONFIG_FILE = "config_client.json"
 DEFAULT_CONFIG = {
     "pos_x": 100,
@@ -30,7 +28,6 @@ DEFAULT_CONFIG = {
 
 CHROMAKEY = (0, 0, 0)
 
-# ========== PARTICLE SYSTEM ==========
 class Spark:
     def __init__(self, x, y, vx, vy, lifetime, color):
         self.x = x
@@ -374,7 +371,6 @@ class SocketClient:
         if self.socket:
             self.socket.close()
 
-# ========== TKINTER CONFIGURATOR ==========
 def run_configurator():
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
@@ -442,7 +438,6 @@ def run_configurator():
     root.mainloop()
     return config
 
-# ========== MAIN PYGAME APP ==========
 def set_window_topmost(hwnd):
     if os.name == 'nt':
         win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
@@ -451,14 +446,12 @@ def set_window_topmost(hwnd):
 def main():
     config = run_configurator()
     
-    # Подключение к серверу
     client = SocketClient(config["socket_host"], config["socket_port"])
     if not client.connect():
         print("Не удалось подключиться к серверу. Убедитесь, что сервер запущен.")
         input("Нажмите Enter для выхода...")
         sys.exit()
-    
-    # Запуск потока приема сообщений
+
     receive_thread = threading.Thread(target=client.receive_messages, daemon=True)
     receive_thread.start()
     
@@ -498,7 +491,7 @@ def main():
 
     current_display_text = None
     display_start_time = 0
-    DISPLAY_DURATION = 5000  # мс
+    DISPLAY_DURATION = 5000 
 
     running = True
     
@@ -516,11 +509,9 @@ def main():
                 elif event.key == pygame.K_F12:
                     current_display_text = None
                     manager.set_text("")
-                    # Очистка очереди клиента
                     while client.get_text():
                         pass
 
-        # Получение нового текста от сервера
         new_text = client.get_text()
         if new_text and not new_text.startswith("Ошибка"):
             current_display_text = new_text
@@ -530,12 +521,10 @@ def main():
             manager.set_text(new_text[:50])
             current_display_text = None
 
-        # Если текст отображается и истекло время показа
         if current_display_text is not None and (current_time_ms - display_start_time) > DISPLAY_DURATION:
             manager.set_text("")
             current_display_text = None
 
-        # Обновление и отрисовка
         screen.fill(CHROMAKEY)
         try:
             manager.update(current_time_sec, dt)
