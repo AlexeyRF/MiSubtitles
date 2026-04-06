@@ -7,7 +7,7 @@ import os
 import socket
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, colorchooser
 
 if os.name == 'nt':
     import win32api
@@ -16,17 +16,29 @@ if os.name == 'nt':
 
 CONFIG_FILE = "config_client.json"
 DEFAULT_CONFIG = {
-    "pos_x": 100,
-    "pos_y": 100,
+    "pos_x": 50,
+    "pos_y": 50,
     "font_size": 60,
-    "window_width": 800,
-    "window_height": 300,
-    "max_line_length": 40,
+    "font_name": "arial",
+    "font_color": "#FFDC64",
+    "enable_sparks": True,
+    "screen_position": "Снизу по центру",
+    "window_width": 1000,
+    "window_height": 400,
+    "max_line_length": 50,
     "socket_host": "127.0.0.1",
-    "socket_port": 12345
+    "socket_port": 12345,
+    "normal_window": False,
+    "antialias": True,
+    "num_slots": 5,
+    "line_spacing": 10  
 }
 
 CHROMAKEY = (0, 0, 0)
+
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 class Spark:
     def __init__(self, x, y, vx, vy, lifetime, color):
@@ -120,35 +132,44 @@ class LetterItem:
         self.target_y = target_y
         self.appear_delay = appear_delay
         self.color_progress = 0.0
+        self.local_y = 0.0  
 
 class SubtitleManager:
-    def __init__(self, font_size, screen_w, screen_h, pos_x, pos_y, max_line_length=40):
-        self.font = pygame.font.Font(None, font_size)
+    def __init__(self, font_size, screen_w, screen_h, pos_x, pos_y, max_line_length, font_name, font_color, enable_sparks, screen_position, antialias, num_slots, line_spacing):
+        try:
+            self.font = pygame.font.SysFont(font_name, font_size)
+        except:
+            self.font = pygame.font.Font(None, font_size)
+            
         self.screen_w = screen_w
         self.screen_h = screen_h
         self.pos_x = pos_x
         self.pos_y = pos_y
         self.max_line_length = max_line_length
+        self.font_color = hex_to_rgb(font_color)
+        self.enable_sparks = enable_sparks
+        self.screen_position = screen_position
+        self.antialias = antialias
+        self.num_slots = max(1, num_slots)
+        self.line_spacing = line_spacing 
         
-        self.current_letters = []
+        self.messages = [] 
         self.pending_destruction = []
         self.falling_letters = []
         self.sparks = []
         self.char_cache = {}
-        
-        self.current_text = ""
 
     def render_char(self, char):
         if char in self.char_cache:
             return self.char_cache[char]
 
-        color_normal = (255, 220, 100)
+        color_normal = self.font_color
         color_white = (255, 255, 255)
         outline_color = (255, 255, 255)
         out_w = 2
         
-        base_normal = self.font.render(char, True, color_normal)
-        base_white = self.font.render(char, True, color_white)
+        base_normal = self.font.render(char, self.antialias, color_normal)
+        base_white = self.font.render(char, self.antialias, color_white)
         w, h = base_normal.get_size()
         
         surf_n = pygame.Surface((w + out_w * 2, h + out_w * 2), pygame.SRCALPHA)
@@ -158,7 +179,7 @@ class SubtitleManager:
             for dy in [-out_w, 0, out_w]:
                 if dx == 0 and dy == 0:
                     continue
-                outline = self.font.render(char, True, outline_color)
+                outline = self.font.render(char, self.antialias, outline_color)
                 surf_n.blit(outline, (dx + out_w, dy + out_w))
                 surf_w.blit(outline, (dx + out_w, dy + out_w))
                 
@@ -169,14 +190,15 @@ class SubtitleManager:
         return surf_n, surf_w, color_normal
 
     def wrap_text(self, text):
-        if len(text) <= self.max_line_length:
-            return [text]
+        max_pixels = max(100, self.screen_w - self.pos_x * 2) 
         
         lines = []
         current_line = ""
         for char in text:
             test_line = current_line + char
-            if len(test_line) <= self.max_line_length:
+            test_width = self.font.size(test_line)[0]
+            
+            if len(test_line) <= self.max_line_length and test_width <= max_pixels:
                 current_line = test_line
             else:
                 if current_line:
@@ -185,41 +207,62 @@ class SubtitleManager:
         if current_line:
             lines.append(current_line)
         
-        if len(lines) > 3:
-            lines = lines[:3]
+        if len(lines) > 4:
+            lines = lines[:4]
             lines[-1] += "..."
         return lines
 
-    def clear_all_letters(self):
-        delay_step = 0.03
-        current_delay = 0.0
-        for item in self.current_letters:
-            self.pending_destruction.append({
-                'surf': item.surf_n,
-                'x': item.x,
-                'y': item.y,
-                'delay': current_delay,
-                'color': item.color
-            })
-            current_delay += delay_step
-        self.current_letters = []
+    def clear_oldest(self):
+        if self.messages:
+            msg = self.messages.pop(0)
+            delay_step = 0.03
+            current_delay = 0.0
+            for item in msg['letters']:
+                self.pending_destruction.append({
+                    'surf': item.surf_n,
+                    'x': item.x,
+                    'y': item.y,
+                    'delay': current_delay,
+                    'color': item.color
+                })
+                current_delay += delay_step
 
-    def set_text(self, text):
-        if self.current_text == text:
+    def clear_all(self):
+        while self.messages:
+            self.clear_oldest()
+
+    def _recalculate_layout(self, is_new=False):
+        if not self.messages:
             return
             
-        self.current_text = text
+        gap_between_msgs = self.line_spacing * 2 
+        total_stack_height = sum(msg['total_height'] for msg in self.messages) + gap_between_msgs * (len(self.messages) - 1)
         
+        if "Сверху" in self.screen_position:
+            current_y = self.pos_y
+        elif "По центру" in self.screen_position and "Сверху" not in self.screen_position and "Снизу" not in self.screen_position:
+            current_y = (self.screen_h - total_stack_height) // 2
+        else: 
+            current_y = self.screen_h - self.pos_y - total_stack_height
+            
+        for i, msg in enumerate(self.messages):
+            for item in msg['letters']:
+                item.target_y = current_y + item.local_y
+                if is_new and i == len(self.messages) - 1 and item.y == 0:
+                    item.y = item.target_y + 20 
+            current_y += msg['total_height'] + gap_between_msgs
+
+    def add_text(self, text, current_time_sec, duration=5.0):
         if not text:
-            self.clear_all_letters()
+            self.clear_all()
             return
         
-        lines = self.wrap_text(text)
-        self.clear_all_letters()
+        if len(self.messages) >= self.num_slots:
+            self.clear_oldest()
         
-        line_height = self.font.get_height() + 10
+        lines = self.wrap_text(text)
+        line_height = self.font.get_height() + self.line_spacing
         total_height = len(lines) * line_height
-        start_y = self.screen_h - self.pos_y - total_height
         
         all_letters = []
         
@@ -234,43 +277,67 @@ class SubtitleManager:
                 else:
                     space_width = self.font.size(" ")[0]
                     empty_surf = pygame.Surface((space_width, 1), pygame.SRCALPHA)
-                    line_surfs.append((' ', empty_surf, empty_surf, (255, 220, 100)))
+                    line_surfs.append((' ', empty_surf, empty_surf, self.font_color))
                     line_widths.append(space_width)
             
             total_width = sum(line_widths)
-            start_x = self.screen_w - total_width - self.pos_x
+            
+            if "слева" in self.screen_position:
+                start_x = self.pos_x
+            elif "справа" in self.screen_position:
+                start_x = self.screen_w - total_width - self.pos_x
+            else:
+                start_x = (self.screen_w - total_width) // 2
+                
             current_x = start_x
             
             for i, (char, surf_n, surf_w, color) in enumerate(line_surfs):
                 if char != ' ':
                     center_x = current_x + line_widths[i] / 2
-                    center_y = start_y + line_idx * line_height + self.font.get_height() / 2
+                    local_y = line_idx * line_height + self.font.get_height() / 2
                     appear_delay = line_idx * 0.1 + i * 0.04
+                    
                     letter = LetterItem(
                         char, surf_n, surf_w, color,
-                        center_x + 15, center_y,
-                        center_x, center_y,
+                        center_x + 15, 0,
+                        center_x, 0,
                         appear_delay
                     )
+                    letter.local_y = local_y
                     all_letters.append(letter)
                 current_x += line_widths[i]
         
-        self.current_letters = all_letters
+        new_msg = {
+            'letters': all_letters,
+            'expiration': current_time_sec + duration,
+            'total_height': total_height
+        }
+        self.messages.append(new_msg)
+        self._recalculate_layout(is_new=True)
 
-    def update(self, current_time, dt):
+    def update(self, current_time_sec, dt):
+        expired = False
+        while self.messages and current_time_sec >= self.messages[0]['expiration']:
+            self.clear_oldest()
+            expired = True
+            
+        if expired:
+            self._recalculate_layout()
+
         for pd in self.pending_destruction[:]:
             pd['delay'] -= dt
             if pd['delay'] <= 0:
                 self.falling_letters.append(FallingLetter(
-                    pd['surf'], pd['x'], pd['y'], pd.get('color', (255, 220, 100))
+                    pd['surf'], pd['x'], pd['y'], pd.get('color', self.font_color)
                 ))
-                self.sparks.extend(create_sparks(
-                    pd['x'], pd['y'], pd.get('color', (255, 220, 100)), count=30
-                ))
+                if self.enable_sparks:
+                    self.sparks.extend(create_sparks(
+                        pd['x'], pd['y'], pd.get('color', self.font_color), count=30
+                    ))
                 self.pending_destruction.remove(pd)
                 
         for fl in self.falling_letters[:]:
-            fl.update(current_time, dt)
+            fl.update(current_time_sec, dt)
             if not fl.active:
                 self.falling_letters.remove(fl)
                 
@@ -280,16 +347,17 @@ class SubtitleManager:
                 self.sparks.remove(sp)
                 
         move_speed = 12.0
-        for item in self.current_letters:
-            if item.appear_delay > 0:
-                item.appear_delay -= dt
-                continue
-            item.x += (item.target_x - item.x) * move_speed * dt
-            item.y += (item.target_y - item.y) * move_speed * dt
-            if item.color_progress < 1.0:
-                item.color_progress += 3.0 * dt
-                if item.color_progress > 1.0:
-                    item.color_progress = 1.0
+        for msg in self.messages:
+            for item in msg['letters']:
+                if item.appear_delay > 0:
+                    item.appear_delay -= dt
+                    continue
+                item.x += (item.target_x - item.x) * move_speed * dt
+                item.y += (item.target_y - item.y) * move_speed * dt
+                if item.color_progress < 1.0:
+                    item.color_progress += 3.0 * dt
+                    if item.color_progress > 1.0:
+                        item.color_progress = 1.0
 
     def draw(self, screen):
         for pd in self.pending_destruction:
@@ -302,20 +370,20 @@ class SubtitleManager:
         for sp in self.sparks:
             sp.draw(screen)
             
-        for item in self.current_letters:
-            if item.appear_delay > 0 or item.char == ' ':
-                continue
-            w, h = item.surf_w.get_size()
-            pos_x = int(item.x) - w // 2
-            pos_y = int(item.y) - h // 2
-            screen.blit(item.surf_w, (pos_x, pos_y))
-            if item.color_progress > 0.0:
-                clip_w = int(w * item.color_progress)
-                if clip_w > 0:
-                    clip_rect = pygame.Rect(0, 0, clip_w, h)
-                    screen.blit(item.surf_n, (pos_x, pos_y), area=clip_rect)
+        for msg in self.messages:
+            for item in msg['letters']:
+                if item.appear_delay > 0 or item.char == ' ':
+                    continue
+                w, h = item.surf_w.get_size()
+                pos_x = int(item.x) - w // 2
+                pos_y = int(item.y) - h // 2
+                screen.blit(item.surf_w, (pos_x, pos_y))
+                if item.color_progress > 0.0:
+                    clip_w = int(w * item.color_progress)
+                    if clip_w > 0:
+                        clip_rect = pygame.Rect(0, 0, clip_w, h)
+                        screen.blit(item.surf_n, (pos_x, pos_y), area=clip_rect)
 
-# ========== SOCKET CLIENT ==========
 class SocketClient:
     def __init__(self, host, port):
         self.host = host
@@ -372,6 +440,10 @@ class SocketClient:
             self.socket.close()
 
 def run_configurator():
+    pygame.font.init()
+    sys_fonts = pygame.font.get_fonts()
+    sys_fonts.sort()
+
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         try:
@@ -383,58 +455,123 @@ def run_configurator():
 
     root = tk.Tk()
     root.title("Настройки субтитров (Клиент)")
-    root.geometry("550x650")
+    root.geometry("600x950") 
     
     tk.Label(root, text="КЛИЕНТ ОТРИСОВКИ СУБТИТРОВ", font=("Arial", 12, "bold"), fg="blue").pack(pady=10)
+    tk.Label(root, text="Настройки подключения:", font=("Arial", 10, "bold")).pack(pady=5)
     
-    tk.Label(root, text="Настройки подключения к серверу:").pack(pady=5)
-    
-    tk.Label(root, text="Хост сервера:").pack(pady=5)
+    host_frame = tk.Frame(root)
+    host_frame.pack()
+    tk.Label(host_frame, text="Хост:").pack(side=tk.LEFT)
     host_var = tk.StringVar(value=config["socket_host"])
-    tk.Entry(root, textvariable=host_var, width=30).pack()
-    
-    tk.Label(root, text="Порт сервера:").pack(pady=5)
+    tk.Entry(host_frame, textvariable=host_var, width=15).pack(side=tk.LEFT, padx=5)
+    tk.Label(host_frame, text="Порт:").pack(side=tk.LEFT)
     port_var = tk.IntVar(value=config["socket_port"])
-    tk.Entry(root, textvariable=port_var, width=30).pack()
+    tk.Entry(host_frame, textvariable=port_var, width=10).pack(side=tk.LEFT)
+
+    tk.Label(root, text="---", fg="gray").pack(pady=5)
     
+    tk.Label(root, text="Внешний вид и анимация:", font=("Arial", 10, "bold")).pack(pady=5)
+
+    tk.Label(root, text="Шрифт:").pack()
+    font_name_var = tk.StringVar(value=config.get("font_name", "arial"))
+    font_cb = ttk.Combobox(root, textvariable=font_name_var, values=sys_fonts, width=30)
+    font_cb.pack()
+
     tk.Label(root, text="Размер шрифта:").pack(pady=5)
     font_var = tk.IntVar(value=config["font_size"])
-    tk.Scale(root, variable=font_var, from_=20, to=150, orient='horizontal').pack()
-    
-    tk.Label(root, text="Отступ справа (px):").pack(pady=5)
-    x_var = tk.IntVar(value=config["pos_x"])
-    tk.Entry(root, textvariable=x_var).pack()
+    tk.Scale(root, variable=font_var, from_=20, to=150, orient='horizontal', length=200).pack()
 
-    tk.Label(root, text="Отступ снизу (px):").pack(pady=5)
+    color_var = tk.StringVar(value=config.get("font_color", "#FFDC64"))
+    def choose_color():
+        color_code = colorchooser.askcolor(title="Выберите цвет текста", initialcolor=color_var.get())[1]
+        if color_code:
+            color_var.set(color_code)
+            color_btn.config(bg=color_code)
+
+    color_btn = tk.Button(root, text="Выбрать цвет текста", bg=color_var.get(), command=choose_color, width=20)
+    color_btn.pack(pady=10)
+
+    sparks_var = tk.BooleanVar(value=config.get("enable_sparks", True))
+    tk.Checkbutton(root, text="Включить искры (анимация разрушения)", variable=sparks_var).pack(pady=2)
+    
+    antialias_var = tk.BooleanVar(value=config.get("antialias", True))
+    tk.Checkbutton(root, text="Включить сглаживание шрифта", variable=antialias_var).pack(pady=2)
+
+    tk.Label(root, text="---", fg="gray").pack(pady=5)
+
+    tk.Label(root, text="Расположение на экране:", font=("Arial", 10, "bold")).pack(pady=5)
+
+    pos_options = ["Снизу по центру", "Сверху по центру", "Снизу слева", "Снизу справа", "Сверху слева", "Сверху справа", "По центру"]
+    pos_var = tk.StringVar(value=config.get("screen_position", "Снизу по центру"))
+    ttk.Combobox(root, textvariable=pos_var, values=pos_options, state="readonly", width=25).pack()
+
+    pos_frame = tk.Frame(root)
+    pos_frame.pack(pady=10)
+    tk.Label(pos_frame, text="Отступ X (px):").pack(side=tk.LEFT)
+    x_var = tk.IntVar(value=config["pos_x"])
+    tk.Entry(pos_frame, textvariable=x_var, width=8).pack(side=tk.LEFT, padx=10)
+    
+    tk.Label(pos_frame, text="Отступ Y (px):").pack(side=tk.LEFT)
     y_var = tk.IntVar(value=config["pos_y"])
-    tk.Entry(root, textvariable=y_var).pack()
+    tk.Entry(pos_frame, textvariable=y_var, width=8).pack(side=tk.LEFT)
+
+    tk.Label(root, text="---", fg="gray").pack(pady=5)
     
-    tk.Label(root, text="Ширина окна субтитров (px):").pack(pady=5)
-    w_var = tk.IntVar(value=config.get("window_width", 800))
-    tk.Entry(root, textvariable=w_var).pack()
+    tk.Label(root, text="Окно и параметры текста:", font=("Arial", 10, "bold")).pack(pady=5)
     
-    tk.Label(root, text="Высота окна субтитров (px):").pack(pady=5)
+    normal_window_var = tk.BooleanVar(value=config.get("normal_window", False))
+    tk.Checkbutton(root, text="Обычное окно (можно перемещать, без прозрачного фона)", variable=normal_window_var).pack(pady=2)
+
+    win_frame = tk.Frame(root)
+    win_frame.pack(pady=5)
+    tk.Label(win_frame, text="Ширина окна:").pack(side=tk.LEFT)
+    w_var = tk.IntVar(value=config.get("window_width", 1000))
+    tk.Entry(win_frame, textvariable=w_var, width=8).pack(side=tk.LEFT, padx=10)
+    
+    tk.Label(win_frame, text="Высота окна:").pack(side=tk.LEFT)
     h_var = tk.IntVar(value=config.get("window_height", 300))
-    tk.Entry(root, textvariable=h_var).pack()
+    tk.Entry(win_frame, textvariable=h_var, width=8).pack(side=tk.LEFT)
     
-    tk.Label(root, text="Максимальная длина строки (символов):").pack(pady=5)
-    line_var = tk.IntVar(value=config.get("max_line_length", 40))
-    tk.Entry(root, textvariable=line_var).pack()
+    slots_frame = tk.Frame(root)
+    slots_frame.pack(pady=5)
+    tk.Label(slots_frame, text="Макс. длина строки:").pack(side=tk.LEFT)
+    line_var = tk.IntVar(value=config.get("max_line_length", 50))
+    tk.Entry(slots_frame, textvariable=line_var, width=8).pack(side=tk.LEFT, padx=10)
+
+    tk.Label(slots_frame, text="Кол-во слотов:").pack(side=tk.LEFT)
+    slots_var = tk.IntVar(value=config.get("num_slots", 2))
+    tk.Entry(slots_frame, textvariable=slots_var, width=8).pack(side=tk.LEFT)
+
+    spacing_frame = tk.Frame(root)
+    spacing_frame.pack(pady=5)
+    tk.Label(spacing_frame, text="Интервал между строками (px):").pack(side=tk.LEFT)
+    spacing_var = tk.IntVar(value=config.get("line_spacing", 10))
+    tk.Entry(spacing_frame, textvariable=spacing_var, width=8).pack(side=tk.LEFT, padx=10)
 
     def save_and_start():
         config["font_size"] = font_var.get()
+        config["font_name"] = font_name_var.get()
+        config["font_color"] = color_var.get()
+        config["enable_sparks"] = sparks_var.get()
+        config["antialias"] = antialias_var.get()
+        config["screen_position"] = pos_var.get()
         config["pos_x"] = x_var.get()
         config["pos_y"] = y_var.get()
         config["window_width"] = w_var.get()
         config["window_height"] = h_var.get()
         config["max_line_length"] = line_var.get()
+        config["num_slots"] = slots_var.get()
+        config["line_spacing"] = spacing_var.get() 
         config["socket_host"] = host_var.get()
         config["socket_port"] = port_var.get()
+        config["normal_window"] = normal_window_var.get()
+        
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f)
+            json.dump(config, f, indent=4)
         root.destroy()
 
-    tk.Button(root, text="Запустить субтитры", command=save_and_start, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
+    tk.Button(root, text="Сохранить и запустить", command=save_and_start, bg="green", fg="white", font=("Arial", 12, "bold")).pack(pady=20)
     root.mainloop()
     return config
 
@@ -451,7 +588,7 @@ def main():
         print("Не удалось подключиться к серверу. Убедитесь, что сервер запущен.")
         input("Нажмите Enter для выхода...")
         sys.exit()
-
+    
     receive_thread = threading.Thread(target=client.receive_messages, daemon=True)
     receive_thread.start()
     
@@ -461,16 +598,35 @@ def main():
     screen_width = info.current_w
     screen_height = info.current_h
     
-    window_width = config.get("window_width", 800)
+    window_width = config.get("window_width", 1000)
     window_height = config.get("window_height", 300)
-    window_x = (screen_width - window_width) // 2
-    window_y = screen_height - window_height - 50
+    screen_position = config.get("screen_position", "Снизу по центру")
+    is_normal_window = config.get("normal_window", False)
+    
+    if "Сверху" in screen_position:
+        window_y = 50
+    elif "По центру" in screen_position and "Сверху" not in screen_position and "Снизу" not in screen_position:
+        window_y = (screen_height - window_height) // 2
+    else:
+        window_y = screen_height - window_height - 50
+
+    if "слева" in screen_position:
+        window_x = 50
+    elif "справа" in screen_position:
+        window_x = screen_width - window_width - 50
+    else:
+        window_x = (screen_width - window_width) // 2
     
     os.environ['SDL_VIDEO_WINDOW_POS'] = f"{window_x},{window_y}"
-    screen = pygame.display.set_mode((window_width, window_height), pygame.NOFRAME)
+    
+    if is_normal_window:
+        screen = pygame.display.set_mode((window_width, window_height))
+    else:
+        screen = pygame.display.set_mode((window_width, window_height), pygame.NOFRAME)
+    
     pygame.display.set_caption("Transparent Subtitles Client")
     
-    if os.name == 'nt':
+    if os.name == 'nt' and not is_normal_window:
         hwnd = pygame.display.get_wm_info()["window"]
         styles = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE,
@@ -480,25 +636,28 @@ def main():
 
     clock = pygame.time.Clock()
     manager = SubtitleManager(
-        config["font_size"],
-        window_width,
-        window_height,
-        config["pos_x"],
-        config["pos_y"],
-        config.get("max_line_length", 40)
+        font_size=config["font_size"],
+        screen_w=window_width,
+        screen_h=window_height,
+        pos_x=config["pos_x"],
+        pos_y=config["pos_y"],
+        max_line_length=config.get("max_line_length", 50),
+        font_name=config.get("font_name", "arial"),
+        font_color=config.get("font_color", "#FFDC64"),
+        enable_sparks=config.get("enable_sparks", True),
+        screen_position=screen_position,
+        antialias=config.get("antialias", True),
+        num_slots=config.get("num_slots", 2),
+        line_spacing=config.get("line_spacing", 10) 
     )
-    manager.set_text("Ожидание подключения к серверу...")
-
-    current_display_text = None
-    display_start_time = 0
-    DISPLAY_DURATION = 5000 
+    
+    manager.add_text("Ожидание подключения к серверу...", pygame.time.get_ticks() / 1000.0, 5.0)
 
     running = True
     
     while running:
         dt = clock.tick(60) / 1000.0
-        current_time_ms = pygame.time.get_ticks()
-        current_time_sec = current_time_ms / 1000.0
+        current_time_sec = pygame.time.get_ticks() / 1000.0
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -507,23 +666,15 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_F12:
-                    current_display_text = None
-                    manager.set_text("")
+                    manager.clear_all()
                     while client.get_text():
                         pass
 
         new_text = client.get_text()
         if new_text and not new_text.startswith("Ошибка"):
-            current_display_text = new_text
-            display_start_time = current_time_ms
-            manager.set_text(new_text)
+            manager.add_text(new_text, current_time_sec, 5.0)
         elif new_text and new_text.startswith("Ошибка"):
-            manager.set_text(new_text[:50])
-            current_display_text = None
-
-        if current_display_text is not None and (current_time_ms - display_start_time) > DISPLAY_DURATION:
-            manager.set_text("")
-            current_display_text = None
+            manager.add_text(new_text[:50], current_time_sec, 5.0)
 
         screen.fill(CHROMAKEY)
         try:
